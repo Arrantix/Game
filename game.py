@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import messagebox
 import threading
 import time
+import math
 
 # Initialize Pygame
 pygame.init()
@@ -42,7 +43,67 @@ DOWN = (0, 1)
 LEFT = (-1, 0)
 RIGHT = (1, 0)
 
+def manhattan_distance(pos1, pos2):
+    """Calculate Manhattan distance between two positions"""
+    return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6, beta=0.4, beta_increment=0.001):
+        self.capacity = capacity
+        self.alpha = alpha  # Priority exponent
+        self.beta = beta    # Importance sampling exponent
+        self.beta_increment = beta_increment
+        self.buffer = []
+        self.priorities = []
+        self.position = 0
+
+    def push(self, state, action, next_state, reward):
+        """Store a transition in the buffer"""
+        transition = Transition(state, action, next_state, reward)
+
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+            self.priorities.append(max(self.priorities) if self.priorities else 1.0)
+        else:
+            self.buffer[self.position] = transition
+            self.priorities[self.position] = max(self.priorities)
+
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        """Sample a batch of transitions based on priorities"""
+        if len(self.buffer) < batch_size:
+            return None
+
+        # Calculate sampling probabilities
+        priorities = np.array(self.priorities)
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+
+        # Sample indices based on priorities
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+
+        # Calculate importance sampling weights
+        weights = (len(self.buffer) * probs[indices]) ** (-self.beta)
+        weights /= weights.max()  # Normalize
+
+        # Get the sampled transitions
+        transitions = [self.buffer[idx] for idx in indices]
+
+        # Update beta for next sampling
+        self.beta = min(1.0, self.beta + self.beta_increment)
+
+        return transitions, indices, weights
+
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors"""
+        for idx, td_error in zip(indices, td_errors):
+            self.priorities[idx] = abs(td_error) + 1e-6  # Add small constant to avoid zero priority
+
+    def __len__(self):
+        return len(self.buffer)
 
 class Snake:
     def __init__(self):
@@ -308,7 +369,7 @@ class DQLAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
-        self.memory = deque(maxlen=10000)
+        self.memory = PrioritizedReplayBuffer(10000)  # Use prioritized replay buffer
         self.batch_size = 128
         self.gamma = 0.99
         self.epsilon = 1.0
@@ -390,9 +451,15 @@ class DQLAgent:
             if dist > 100:  # max
                 return 100
 
-    def select_action(self, state):
+    def select_action(self, state, snake=None, food=None):
         if random.random() < self.epsilon:
-            return random.randint(0, 3)
+            if snake is not None and food is not None:
+                ai = SnakeAI(snake, food)
+                direction = ai.get_best_direction()
+                directions = [UP, DOWN, LEFT, RIGHT]
+                return directions.index(direction)
+            else:
+                return random.randint(0, 3)
         else:
             with torch.no_grad():
                 state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -400,31 +467,60 @@ class DQLAgent:
                 return q_values.argmax().item()
 
     def store_transition(self, state, action, next_state, reward):
-        self.memory.append(Transition(state, action, next_state, reward))
+        self.memory.push(state, action, next_state, reward)
 
     def optimize_model(self):
         if len(self.memory) < self.batch_size:
             return
-        transitions = random.sample(self.memory, self.batch_size)
+
+        # Sample from prioritized replay buffer
+        sample_result = self.memory.sample(self.batch_size)
+        if sample_result is None:
+            return
+
+        transitions, indices, weights = sample_result
         batch = Transition(*zip(*transitions))
-        state_batch = torch.tensor(batch.state, dtype=torch.float32).to(self.device)
-        action_batch = torch.tensor(batch.action, dtype=torch.long).to(self.device)
-        reward_batch = torch.tensor(batch.reward, dtype=torch.float32).to(self.device)
-        next_state_batch = torch.tensor(batch.next_state, dtype=torch.float32).to(self.device)
+
+        # Optimized tensor creation: pre-convert to numpy arrays
+        states = np.array(batch.state, dtype=np.float32)
+        actions = np.array(batch.action, dtype=np.long)
+        rewards = np.array(batch.reward, dtype=np.float32)
+        next_states = np.array(batch.next_state, dtype=np.float32)
+
+        # Create tensors directly from numpy arrays
+        state_batch = torch.from_numpy(states).to(self.device)
+        action_batch = torch.from_numpy(actions).to(self.device)
+        reward_batch = torch.from_numpy(rewards).to(self.device)
+        next_state_batch = torch.from_numpy(next_states).to(self.device)
+        weights_batch = torch.from_numpy(weights).to(self.device)
+
         # Compute Q(s_t, a)
         state_action_values = self.policy_net(state_batch).gather(1, action_batch.unsqueeze(1))
+
         # Compute V(s_{t+1}) for all next states
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         with torch.no_grad():
             next_state_values = self.target_net(next_state_batch).max(1)[0]
+
         # Compute expected Q values
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch
-        # Compute loss
-        loss = F.mse_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        # Compute TD errors
+        td_errors = (state_action_values.squeeze() - expected_state_action_values).detach().cpu().numpy()
+
+        # Update priorities based on TD errors
+        self.memory.update_priorities(indices, td_errors)
+
+        # Compute loss with importance sampling weights
+        loss = F.mse_loss(state_action_values, expected_state_action_values.unsqueeze(1), reduction='none')
+        loss = (loss.squeeze() * weights_batch).mean()
+
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        return loss.item()
 
     def update_target_net(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -438,6 +534,31 @@ class DQLAgent:
     def load_model(self, path):
         self.policy_net.load_state_dict(torch.load(path))
         self.policy_net.eval()
+
+    def can_reach_food(self, head_pos, food_pos, snake_positions):
+        """Check if snake can reach food using BFS"""
+        from collections import deque
+        queue = deque([head_pos])
+        visited = set([head_pos])
+
+        while queue:
+            current = queue.popleft()
+            if current == food_pos:
+                return True
+
+            # Check all 4 directions
+            for dx, dy in [UP, DOWN, LEFT, RIGHT]:
+                nx = current[0] + dx * BLOCK_SIZE
+                ny = current[1] + dy * BLOCK_SIZE
+                new_pos = (nx, ny)
+
+                # Check if position is safe and not visited
+                if (0 <= nx < SCREEN_WIDTH and 0 <= ny < SCREEN_HEIGHT and
+                    new_pos not in snake_positions and new_pos not in visited):
+                    visited.add(new_pos)
+                    queue.append(new_pos)
+
+        return False
 
 def draw_text(surface, text, color, x, y):
     textobj = FONT.render(text, 1, color)
@@ -656,18 +777,40 @@ def main(train=False):
                 directions = [UP, DOWN, LEFT, RIGHT]
                 snake.turn(directions[action])
 
+                # Calculate current distance to food
+                current_distance = manhattan_distance(snake.get_head_position(), food.position)
+
                 # Move snake
                 move_successful = snake.move()
-                reward = -1
+                reward = 0
                 if not move_successful:
                     reward = -10
                     done = True
                 else:
-                    if snake.get_head_position() == food.position:
-                        snake.length += 1
-                        score += 1
-                        reward += 10
-                        food.randomize_position(set(snake.positions))
+                    # Calculate new distance after move
+                    new_distance = manhattan_distance(snake.get_head_position(), food.position)
+
+                    # Reward based on distance change (only if not eating food)
+                    if snake.get_head_position() != food.position:
+                        if new_distance < current_distance:
+                            reward += 3  # Closer to food
+                        elif new_distance > current_distance:
+                            reward -= 1  # Farther from food
+
+                        # Path blocking penalty: if after move, snake cannot reach food, penalize
+                        if not agent.can_reach_food(snake.get_head_position(), food.position, set(snake.positions)):
+                            reward -= 5  # Path blocking penalty
+
+                if snake.get_head_position() == food.position:
+                    snake.length += 1
+                    score += 1
+                    reward += 25
+                    food.randomize_position(set(snake.positions))
+
+                # Penalize if not found first apple after 500 steps
+                if steps >= 500 and score == 0:
+                    reward = -10
+                    done = True
 
                 next_state = agent.get_state(snake, food)
                 agent.store_transition(state, action, next_state, reward)
@@ -894,13 +1037,9 @@ def game_over(screen, score):
                 if event.key == pygame.K_c:
                     main()
 
-# Directions
-UP = (0, -1)
-DOWN = (0, 1)
-LEFT = (-1, 0)
-RIGHT = (1, 0)
-
 if __name__ == '__main__':
+    train_mode = False
     import sys
-    train_mode = len(sys.argv) > 1 and sys.argv[1] == 'train'
+    if len(sys.argv) > 1 and sys.argv[1] == 'train':
+        train_mode = True
     main(train=train_mode)
